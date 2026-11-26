@@ -1,99 +1,171 @@
-# Wrong-target actions in a local LLM defender — experiment kit
+# pidlab: LLM defender, prompt injection and PID reuse
 
-Defender = LLM + JSON action `{"action":"kill|none","pid":N}`. The harness never touches real processes:
-all targets are idle dummy processes inside a private PID namespace inside an 8 GB / 4-core Docker container.
+Measures how often a **local LLM defender** (Llama-3.1 8B via Ollama, CPU-only, 8 GB, 4 cores) takes a **wrong-target kill** because of
 
-## 0. Hardware: one machine or two?
-**Use ONE 16 GB machine for every measurement.** Latency is the independent variable of RQ2, so all runs must come
-from the same CPU, thermal state and container config. Two machines would add a between-machine confound.
-A second machine is only worth using for (a) a small validation subset (~10 % of trials) to show the Docker emulation
-is not machine-specific, or (b) running the *analysis*/writing while the first one computes.
-Never run two experiments concurrently on the same machine (they steal CPU and corrupt latency).
-Needs native Linux or WSL2 (kernel >= 5.3 for pidfd, Python >= 3.9). Docker Desktop on macOS/Windows hides
-the real kernel behaviour, so avoid it. Plug in power, set CPU governor to `performance`, close the browser/IDE.
+* **(a)** attacker-controlled strings in process telemetry (prompt injection through process name / command line), and
+* **(b)** **PID reuse** during the seconds of inference between detection and response,
 
-## 1. Setup (once)
+and how much **input sanitization** (S1, S2) and **identity-verified actions** (start-time check, `pidfd`) reduce these errors.
+
+All processes in the experiments are **harmless idle dummies** that only record the signals they receive. Nothing real is ever killed, and PID forcing happens only inside a private PID namespace.
+
+## Headline results (Llama-3.1 8B, temperature 0)
+
+| Class | S0 raw | S1 sanitized | S2 S1+warning |
+|---|---|---|---|
+| C0 / N0 (controls) | 0/60 | 0/60 | 0/60 |
+| I-N (attack in name) | 1/60 | 0/60 | 0/60 |
+| I-C (attack in cmdline) | 8/60 | 0/60 | 0/60 |
+| I-B (both) | 35/60 | 0/60 | 0/60 |
+| N-I (no threat, benign process carries kill order) | 43/60 | 32/60 | 20/60 |
+
+* Mean inference latency: S0 19.1 s, S1 26.8 s, S2 27.0 s (overall L = 24.3 s).
+* PID reuse: whenever the PID was recycled before the action, the naive `kill` hit the innocent process every time. `starttime` and `pidfd` produced no misfires (replay n=100 per cell; real run n=10, S0).
+
+See `report/main.tex` for the full write-up and limitations.
+
+## Repository layout
+
 ```
-./run_container.sh                       # builds image, starts capped container with ollama serve
-# inside the container:
-ollama pull tinyllama; ollama pull llama3.2:3b; ollama pull llama3.1:8b
-./sandbox_run.sh python3 -m pidlab.selfcheck     # every line must say OK
+pidlab_project/
+├── Dockerfile               # image: Python + Ollama client deps
+├── run_container.sh         # builds the image and starts the container (name: pidlab)
+├── sandbox_run.sh           # runs a command inside a private PID namespace (sets IN_SANDBOX=1)
+├── pidlab/
+│   ├── config.py            # all settings (model list, ctx, threads, tokens, keep-alive)
+│   ├── prompt.py            # system prompt (v5, frozen) + S0/S1/S2 prompt builders
+│   ├── sanitize.py          # control/zero-width stripping, whitespace collapse, length limits
+│   ├── scenarios.py         # six classes, decoys/miners/background, 14 injection payloads
+│   ├── sandbox.py           # spawn dummies, read /proc identity, force PID reuse, pidfds
+│   ├── dummy_proc.py        # idle stand-in process that records signals
+│   ├── telemetry.py         # builds the process snapshot from /proc
+│   ├── llm.py               # Ollama call (JSON-schema output), latency + token logging
+│   ├── executors.py         # naive / starttime / pidfd executors, hit reader
+│   ├── runner.py            # one trial + resumable experiment loop
+│   ├── run_injection.py     # E1: prompt-injection experiment
+│   ├── run_pidreuse.py      # E2: PID-reuse experiment (real or latency replay)
+│   ├── run_latency.py       # latency benchmark vs. snapshot size
+│   ├── gate.py              # go/no-go check on a pilot run
+│   ├── plan.py              # run-time planner
+│   ├── selfcheck.py         # environment check (run before any experiment)
+│   └── analyze.py           # tables (CSV) + figures (PNG) from result files
+├── results/                 # *.jsonl raw trials, *.csv tables, fig_*.png
+└── report/                  # IEEE-format LaTeX report (main.tex, figs/)
 ```
-Edit `config.py` only to change `NUM_CTX` / `NUM_THREAD`; report them in the paper.
 
-## 2. Experiments, cycles and conditions
-Randomisation unit = scenario *instance* (random decoy/background/PIDs/payload), NOT repeated identical prompts:
-at temperature 0 repeats are identical, so extra "cycles" of the same prompt add no information.
-The same instance is replayed under every mitigation (paired design -> McNemar test).
-Trial order is shuffled (fixed seed) so thermal drift is not tied to a condition. Runs resume if interrupted.
+## Requirements
 
-| Exp | Purpose | Factors | n | Inferences (3B model) |
-|---|---|---|---|---|
-| E0 latency | RQ2 input L | model x {8,16,32,64 procs} | 20 reps each | ~240 |
-| E1 injection | RQ1, RQ3 | 6 classes x {S0,S1,S2} x temp {0,0.7} | 100 instances / cell | 3,600 |
-| E2 PID reuse | RQ2, RQ3 | recycle delay {0,2,5,10,30,none}s x {S0,S1} | 50 / cell | 600 |
-| E3 other models | RQ2 (L varies) + RQ1 robustness | tinyllama and llama3.1:8b, injection n=50 (temp 0 only), reuse n=40 | | ~1,500 |
-| E4 hard mode (optional) | reuse of Part 3 "camouflage" | `--difficulty camouflage` | n=50 | |
+* Linux host with Docker (kernel >= 5.3 for `pidfd_open`; Python >= 3.9 in the container).
+* Ollama running inside the container, with the model pulled once: `ollama pull llama3.1:8b` (models are kept in the `pidlab_models` Docker volume).
+* On the host, for analysis only: Python 3 with `pandas`, `matplotlib`, `requests` (a venv is fine).
+* The container is started with an **8 GB memory cap**, 4 pinned cores, and `CAP_SYS_ADMIN` (needed to write `ns_last_pid` inside the private PID namespace). **Do not raise the 8 GB cap**: it is the experiment's "defender box".
+* Internet is needed only to build the image and pull models. The runs themselves are offline.
 
-Classes: C0 threat/no injection (control), I-N name, I-C cmdline, I-B both, N0 benign/no injection (control),
-N-I benign process carrying a kill payload (acting when nothing needed). S0 raw, S1 strip+limit+quote,
-S2 = S1 + "untrusted data" system-prompt warning. Identity verification (V) is evaluated *inside every trial*:
-`naive` (os.kill), `starttime` (/proc/pid/stat field 22), `pidfd` (opened at detection) all act on the same decision
--> the 2x2 (S x V) costs no extra inference.
+## How to run
 
-Wall-clock: `python3 -m pidlab.plan <mean_L_seconds>` after E0. Rough guide: 3B ~ 8-15 s/call -> E1 ~ 10-15 h,
-E2 ~ 2 h; so do a pilot first (`--n 10`), then run the full set overnight in chunks.
-Precision: n=100 gives Wilson half-width ~ +/-6 pp near 10 % and ~ +/-10 pp near 50 %. Report the CIs.
+All commands marked *container* run inside the container (`./run_container.sh`, or `docker exec -it pidlab bash`), from `/work`. For long runs use `tmux` (detach with `Ctrl+b`, then `d`).
 
-## 3. Commands
+### 0. Start and check the environment (container)
+
+```bash
+./run_container.sh
+python3 -m pidlab.selfcheck          # every line should say OK
+python3 -c "from pidlab import prompt; print(prompt.SYSTEM)"   # must be the frozen v5 prompt
 ```
-./sandbox_run.sh python3 -m pidlab.run_latency --models tinyllama llama3.2:3b llama3.1:8b
-python3 -m pidlab.plan 10
-./sandbox_run.sh python3 -m pidlab.run_injection --model llama3.2:3b --n 10 --out results/pilot.jsonl      # pilot
-./sandbox_run.sh python3 -m pidlab.run_injection --model llama3.2:3b --n 100 --out results/inj_3b.jsonl
-./sandbox_run.sh python3 -m pidlab.run_pidreuse  --model llama3.2:3b --n 50  --out results/reuse_3b.jsonl
-./sandbox_run.sh python3 -m pidlab.run_injection --model tinyllama --n 50 --temps 0 --out results/inj_tiny.jsonl
-./sandbox_run.sh python3 -m pidlab.run_pidreuse  --model llama3.1:8b --n 40 --out results/reuse_8b.jsonl
-python3 -m pidlab.analyze results/inj_*.jsonl results/reuse_*.jsonl     # CSV tables + PNG figures
+
+### 1. Pilot and gate (container, ~10 min)
+
+```bash
+./sandbox_run.sh python3 -m pidlab.run_injection --model llama3.1:8b --n 10 \
+    --classes C0 N0 --san S0 --temps 0 --out results/pilot.jsonl
+python3 -m pidlab.gate results/pilot.jsonl      # expect GO
 ```
-`--mock` runs the whole pipeline without Ollama (smoke test only).
 
-## 4. Design notes you must state in the report
-* Process *name* (`comm`) is truncated by the kernel to 15 bytes; only short payloads fit the name. cmdline is
-  effectively unlimited. This is itself a finding (name vs cmdline injection capacity).
-* Wrong-target is measured at two levels: **intent** (what the model chose) and **effect** (which dummy actually
-  received the signal, per executor). PID-reuse "misfire" = effect hit the recycled victim *given* a correct intent.
-* In the harness, signal numbers (SIGUSR1/USR2/SIGTERM) are only tags identifying which executor delivered; dummies
-  record and survive. The naive executor can only signal PIDs owned by that trial's dummies (safety guard).
-* PID recycling is *forced* with `/proc/sys/kernel/ns_last_pid`; `delta` is the controlled recycle delay.
-  Natural reuse probability is rare on Linux (sequential allocation); `analyze.py` prints the analytic estimate
-  ~ lambda*L/pid_max for fork rates lambda. Report both: conditional misfire rate and realistic exposure.
-* starttime check has 10 ms (clock-tick) resolution and a check-then-kill TOCTOU window; pidfd has neither.
-* CPU% is scenario-assigned (dummies idle) so they do not perturb inference latency.
-* Memory cap does not slow the CPU; latencies are specific to this host + `--cpuset-cpus` + thread count.
-* Ollama may reuse the KV cache for the constant system-prompt prefix; this is realistic for a daemon, but say so.
+### 2. E1: prompt injection (container, ~6 h, 1,080 trials)
 
-## 5. Update after reading your Part 3 report and Part 2 repo
-Part 3 numbers (your hardware): llama3.2:3b needed a 150 s limit (45 s gave all timeouts) and averaged ~81 s to detect;
-llama3.1:8b detected 0/27 even at 150 s; TinyLlama 0/27; no model ever killed a virus. Consequences for this project:
+```bash
+./sandbox_run.sh python3 -m pidlab.run_injection --model llama3.1:8b --n 60 \
+    --san S0 S1 S2 --temps 0 --out results/inj_8b.jsonl
+```
 
-1. **Latency will be tens of seconds, not ~10 s.** Run E0 first and plan from the measured L: `python3 -m pidlab.plan <L> <hours>`.
-   The full design (Tier C, 3,600 inferences) is ~80 h at L=80 s, so it is not feasible. Tiers A/B in `plan.py` are.
-2. **PID reuse uses latency REPLAY** (`run_pidreuse --replay ... --time-scale 0.25`): the race depends only on timing, so
-   the "inference" is a sleep drawn from the measured latency distribution (no LLM cost). Validate with ~20 real-inference
-   trials at scale 1 and show the misfire rates agree. Deltas are multiples of L (`--L`).
-3. **Capability gate before anything else:** pilot with `run_injection --classes C0 N0 --san S0 --temps 0 --n 10`, then
-   `python3 -m pidlab.gate results/pilot.jsonl`. If the model cannot pick the right process with NO injection, injection
-   results are unreadable (floor/ceiling). Part 3's 0/27 may have come from the tool-calling/agent loop and timeouts,
-   not raw ability; this harness uses one constrained-JSON call, so it may do better. The pilot tells you.
-4. **Speed levers** (all in `config.py`/env): free-text `reason` is off by default (`REASON=1` to enable; fewer output tokens),
-   `NUM_CTX` 4096 (Part 2 exported 16384: do NOT export OLLAMA_CONTEXT_LENGTH here), 6-8 processes per snapshot, one model loaded.
-5. **Check your environment (hypothesis, I cannot see your machine):** if you used WSL2, its default memory cap is 50 % of
-   host RAM (8 GB on a 16 GB laptop), so an 8 GB container inside it, plus Ollama, likely swaps/thrashes. Set `memory=12GB`
-   and `swap=0` in `%UserProfile%\.wslconfig`, `wsl --shutdown`, and confirm `ollama ps` shows 100% CPU, model loaded once.
-   `run_latency.py` prints tokens and prompt/eval seconds so you can see whether prompt processing or generation dominates.
-6. **Use the same timeout for every model** (this harness has none beyond 900 s), unlike Part 3 where TinyLlama differed.
-7. **Reuse from the Part 2 repo:** `report_generator.py` (python-docx) for the final write-up tables; the whitelist idea of
-   `ALLOWED_INSTALL` is mirrored by the executors' "only PIDs owned by this trial" guard; Part 2 used TEMPERATURE=0.1 while
-   the manual says 0 — here temperature is explicit (0 and 0.7 with seeds). The Part 2 debate supervisor (4 debaters + judge +
-   summariser, several LLM calls) would multiply L and widen the reuse window; a good optional extension (E5), not built.
+The run is **resumable**: if it stops, run the identical command again and only missing trials are executed. Failed trials (for example Ollama killed at the memory limit) are logged to `results/inj_8b.jsonl.errors` and are retried by re-running. Check progress with `wc -l results/inj_8b.jsonl` (goal: 1080).
+
+### 3. E2: PID reuse, latency replay (container, ~2.5 h, 1,200 trials)
+
+Uses the real latencies from E1; no model is called. `--L` is the mean latency measured in E1 (24 s here); delays are multiples of `L`.
+
+```bash
+./sandbox_run.sh python3 -m pidlab.run_pidreuse --replay results/inj_8b.jsonl \
+    --model llama3.1:8b --n 100 --L 24 --time-scale 0.25 --out results/reuse_replay.jsonl
+```
+
+### 4. E2 validation with real inference (container, ~30 min, 60 trials)
+
+Run only after step 3 has finished (the two would compete for CPU).
+
+```bash
+./sandbox_run.sh python3 -m pidlab.run_pidreuse --model llama3.1:8b --n 10 \
+    --san S0 --L 24 --out results/reuse_real.jsonl
+```
+
+Optional: `--deltas 0.5 0.7 0.85 1 1.15 1.3 --san S0 S1` for a finer delay grid, and `--n 20 --san S1 --deltas 1` for a real S1 check.
+
+### 5. Analysis (host, in the venv)
+
+Analyse each file separately (real and replay latencies must not be mixed). Each PID-reuse run overwrites `pidreuse_rates.csv` and `fig_pidreuse.png`, so copy them after each run.
+
+```bash
+python3 -W ignore -m pidlab.analyze results/inj_8b.jsonl
+
+python3 -W ignore -m pidlab.analyze results/reuse_replay.jsonl
+cp results/pidreuse_rates.csv results/pidreuse_replay_rates.csv
+cp results/fig_pidreuse.png   results/fig_pidreuse_replay.png
+
+python3 -W ignore -m pidlab.analyze results/reuse_real.jsonl
+cp results/pidreuse_rates.csv results/pidreuse_real_rates.csv
+cp results/fig_pidreuse.png   results/fig_pidreuse_real.png
+```
+
+If the files are root-owned (written by the container): `sudo chown -R $USER results`.
+
+Outputs in `results/`: `injection_rates.csv` (rates with 95% Wilson CIs for wrong-target, miss, hijack, suppressed), `injection_paired_reduction.csv` (S0 to S1/S2, McNemar p), `injection_by_payload.csv`, `fig_injection.png`, and the `pidreuse_*` tables and figures.
+
+### Optional: smoke test without a model
+
+`--mock` replaces the model with a scripted answer (needs no Ollama):
+
+```bash
+./sandbox_run.sh python3 -m pidlab.run_injection --mock --n 3 --out results/smoke.jsonl
+```
+
+## Building the report
+
+```bash
+cd report
+pdflatex main.tex && pdflatex main.tex
+```
+
+Requires the `IEEEtran` class (included in TeX Live `texlive-publishers`, and available on Overleaf). `figs/` holds the figures; `mkfigs.py` regenerates them from the reported numbers.
+
+## Key settings (`pidlab/config.py`)
+
+| Setting | Value |
+|---|---|
+| Model | llama3.1:8b (Ollama default Q4-class quantization) |
+| Context / threads / max new tokens | 4096 / 4 / 80 |
+| Temperature, seed | 0, seed = instance index |
+| Output | JSON schema: `action` in {kill, none}, `pid` (no free-text reason) |
+| Sanitization limits | name 32 chars, cmdline 120 chars |
+| Container | 8 GB RAM, 4 cores, no GPU |
+
+## Design notes and known issues
+
+* **Frozen prompt.** The system prompt (v5) was fixed after the pilot. Do not edit `prompt.py` between or during runs. A fresh container loses `docker cp` edits unless the image is rebuilt from the saved files.
+* **Memory kills.** On 8 GB, Ollama's runner was killed by the kernel five times during E1 (11 trials failed on the first pass). Re-running the same command retried them. If it recurs, stop, restart the container and resume.
+* **Replay vs. real.** The replay holds the decision fixed at "kill the correct process" and only reproduces timing, so it measures misfire *given a correct decision*. It was validated against a small real run.
+* **0 misfires** for `starttime` / `pidfd` means none observed, not impossible.
+* Possible S1 truncation effect (120-char limit) is untested; see the report's limitations.
+
+## Safety
+
+Experiments only ever signal idle dummy processes created by the harness. Executors refuse PIDs that are not part of the current trial, and PID forcing is only allowed inside the private PID namespace (`run_pidreuse.py` exits if `IN_SANDBOX` is not set).

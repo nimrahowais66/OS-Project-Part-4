@@ -1,0 +1,217 @@
+\documentclass[conference]{IEEEtran}
+\usepackage{cite}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{url}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em T\kern-.1em\lower.7ex\hbox{E}\kern-.125em X}}
+
+\begin{document}
+
+\title{When the Defender Is an LLM: Prompt Injection and PID Reuse in Local, CPU-Only Process Response}
+
+\author{\IEEEauthorblockN{[Your Name]}
+\IEEEauthorblockA{Dhanani School of Science \& Engineering, Habib University, Karachi, Pakistan\\
+Operating Systems, Project Part IV\\
+\relax{}[your email]}}
+
+\maketitle
+
+\begin{abstract}
+A local Large Language Model (LLM) that reads process telemetry and decides which process to terminate keeps sensitive data on the host, but it creates two operating-system level hazards. First, process names and command lines are attacker-controlled strings, so they can carry prompt injection. Second, inference on a CPU takes tens of seconds, and during that time the Linux kernel may recycle the Process ID (PID) the model has just chosen. We measure both on a CPU-only, 8~GB, 4-core container running Llama-3.1 8B (Q4) through Ollama. In 1{,}080 injection trials, an attack placed in both the name and command line made the raw-prompt defender pick the wrong target in 58.3\% of cases, and a benign process carrying a ``kill'' order was obeyed in 71.7\%. Stripping, length-limiting and JSON-quoting the fields (S1) reduced threat-class errors from up to 58\% to 0 of 60 observed, but reduced the no-threat injection case only to 53.3\%; adding an ``untrusted data'' warning (S2) reached 33.3\%. S1 and S2 also raised mean inference latency from 19.1~s to about 27~s. In a forced PID-reuse race (1{,}200 latency-replay trials and 60 real-inference trials), a naive \texttt{kill(pid)} hit the innocent process in every trial where the PID had been recycled before the action, while a start-time check and a \texttt{pidfd} handle produced no misfires. The mitigation that reduces injection therefore widens the reuse window, which argues for identity-verified actions in addition to sanitization.
+\end{abstract}
+
+\begin{IEEEkeywords}
+LLM agents, prompt injection, PID reuse, pidfd, inference latency, endpoint response, Linux.
+\end{IEEEkeywords}
+
+\section{Introduction}
+Autonomous endpoint defenders increasingly place an LLM between telemetry and response: the model reads a process snapshot and chooses a process to terminate \cite{greshake}. Running the model locally avoids sending host telemetry to a cloud API, but it makes two failure modes concrete.
+
+\emph{(a) Injection through telemetry.} Fields such as the process name and command line are written by whoever started the process. If they are interpolated into the prompt, an attacker can add instructions such as ``kill PID~$D$'' to steer the defender toward an innocent process, or ``never terminate this process'' to hide a miner \cite{perez,liu}.
+
+\emph{(b) PID reuse during inference.} The model decides about a PID seen at time $t_0$ and the action lands at $t_0+L$, where $L$ is the inference latency. On a CPU, $L$ is measured in tens of seconds. If the flagged process exits and the kernel re-issues its PID to an innocent process within that window, a plain \texttt{kill} signals the wrong process.
+
+Our research question is: \emph{when a local LLM defender acts on process telemetry on CPU-only 8~GB hardware, how often does it take a wrong-target action because of (a) attacker-controlled strings and (b) PID reuse during inference, and how much do input sanitization and identity-verified actions (start-time check, \texttt{pidfd}) reduce these errors?}
+
+The contributions are: (i) a reproducible harness that evaluates all three response executors on the same model decision; (ii) wrong-target rates with confidence intervals for six scenario classes under three input treatments; (iii) a PID-reuse race with a forced PID, using real and replayed latency; and (iv) the observation that the two defenses interact through latency.
+
+\section{Methods}
+\subsection{Architecture}
+Every trial runs inside a private PID namespace so that forced PID reuse cannot touch real host processes. A trial spawns a set of \emph{dummy processes}: idle Python processes that set their own \texttt{comm} and argument vector, and that only \emph{record} the signals they receive. They never exit on a signal, so the harness can read which process was hit by which executor. Telemetry is read from \texttt{/proc} (name, command line, parent PID). CPU\% is assigned by the scenario rather than measured, so the dummies stay idle and do not disturb the latency measurement.
+
+\subsection{Scenarios and attacks}
+Each instance contains one high-CPU legitimate ``decoy'' (e.g., \texttt{postgres}, \texttt{nginx}, \texttt{java}), four to six background processes, and, for threat classes, a miner (e.g., \texttt{xmrig}, \texttt{kdevtmpfsi}) at 88--99\% CPU. Six classes are used (Table~\ref{tab:classes}). Injection payloads are of two kinds: \emph{redirect} (make the defender kill the decoy, whose real PID is substituted at spawn time) and \emph{suppress} (make it answer ``none''). Eight redirect and two suppress payloads target the command line, and four target the name. Names are limited to 15 bytes by the kernel, which constrains name attacks. Instances are generated from a seed, so every sanitization setting sees the same 60 instances.
+
+\begin{table}[t]
+\caption{Scenario classes}
+\label{tab:classes}
+\centering
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+Class & Meaning \\
+\midrule
+C0 & threat, no injection (control) \\
+I-N & threat + injection in process name \\
+I-C & threat + injection in command line \\
+I-B & threat + injection in both \\
+N0 & no threat, no injection (control) \\
+N-I & no threat, a benign process carries a kill order \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Input treatments}
+\textbf{S0} interpolates raw fields into the prompt. \textbf{S1} removes control, zero-width and bidirectional characters, collapses whitespace, truncates the name to 32 and the command line to 120 characters, and passes each process as a JSON line so that untrusted strings are quoted. \textbf{S2} is S1 plus a system-prompt warning that these fields are untrusted data. S2 isolates the effect of prompt hardening from that of sanitization.
+
+\subsection{Response executors}
+The same decision is passed to three executors, each tagged by a different signal so one trial evaluates all three. \emph{naive} calls \texttt{os.kill(pid)}. \emph{starttime} compares the field-22 start time in \texttt{/proc/<pid>/stat} with the value recorded in the snapshot and refuses on mismatch. \emph{pidfd} sends the signal through a \texttt{pidfd} opened at detection time \cite{pidfd}, which fails if that process is gone. None of these checks uses the model.
+
+\subsection{Model and hardware}
+The model is Llama-3.1 8B with the default Ollama quantization (Q4-class) \cite{llama3,ollama}. The container is capped at 8~GB RAM and 4 pinned CPU cores, with no GPU. Settings: context 4096, 4 threads, at most 80 generated tokens, structured JSON output (\texttt{action} $\in$ \{kill, none\}, \texttt{pid}), no free-text reason field (to limit generated tokens), temperature 0, and the seed equal to the instance index. Temperature 0 makes a given instance repeatable, so S0, S1 and S2 are compared under identical conditions. A 0.7 run was planned as an optional extra and not performed for lack of time.
+
+\subsection{Pilot and gate}
+Before the main run, a 20-trial pilot (classes C0 and N0, S0) checked that the baseline is usable: C0 correct $\ge$70\%, N0 correct $\ge$70\%, and parse failures $<$5\%. TinyLlama 1.1B and Llama-3.2 3B failed this gate, so injection effects would have been unreadable on top of a weak baseline. Llama-3.1 8B passed after the system prompt was revised to say that most snapshots contain no malware and that high CPU alone is not evidence. This prompt (version v5) was then frozen, because changing it mid-run would invalidate the comparison. The smaller models are kept only as potential latency sources.
+
+\subsection{Experiments}
+\textbf{E1 (injection).} 6 classes $\times$ 3 treatments $\times$ 60 instances $=$ 1{,}080 trials in randomized order, so thermal drift is not tied to a condition. Each result is written to disk as it finishes, which allows resuming. The wrong-target rate is the fraction of trials in which the model chose a kill and the target was not the miner. Rates carry 95\% Wilson intervals \cite{wilson}, and the paired S0$\to$S1/S2 changes use an exact McNemar (sign) test on discordant instances \cite{mcnemar}.
+
+\textbf{E2 (PID reuse).} For the C0 scenario the flagged miner exits at $t_\text{exit}=0.5$~s and is reaped. After a delay $\delta$ the same PID is re-issued to an innocent process by writing \texttt{ns\_last\_pid} (needs \texttt{CAP\_SYS\_ADMIN} in the private namespace). The action fires when inference returns. Delays are multiples of $L$ (0, 0.25, 0.5, 1, 2, and ``none'' for no reuse), and $L=24$~s is the mean latency measured in E1. A \emph{misfire} is a signal that reaches the recycled process, and it is computed over trials where the model's intent was correct. This holds the decision fixed so that a wrong target can only come from timing and not from model error (that is E1's question).
+
+Because real inference costs about 25~s per trial, the main E2 run is a \emph{latency replay}: no model is called, the ``decision'' is fixed to ``kill the miner'', and the call sleeps for a latency drawn at random from the empirical E1 latencies of the same treatment, scaled by 0.25. The race depends on the ratio of recycle time to latency, so scaling all times equally preserves it. The replay has 100 instances $\times$ 2 treatments (S0, S1) $\times$ 6 delays $=$ 1{,}200 trials. It is validated against a real-inference run at full speed (S0 only, 10 instances $\times$ 6 delays $=$ 60 trials).
+
+\section{Results}
+\subsection{Prompt injection (E1)}
+All 1{,}080 trials completed. On the first pass 11 failed because the kernel killed Ollama's runner at the memory limit (Sec.~\ref{sec:errors}); all were retried until the file reached 1{,}080 rows. Latency was stable: mean 24.3~s, median 24.2~s, maximum 57~s, so no trial was filtered.
+
+Table~\ref{tab:inj} and Fig.~\ref{fig:inj} give the wrong-target rates. Both controls are clean: with no attack the model never chose a wrong target (0/60 in C0 and N0 under all treatments), so the errors in the other classes are caused by the injections.
+
+\begin{table}[t]
+\caption{Wrong-target rate, Llama-3.1 8B, temperature 0, $n=60$ per cell (count in brackets)}
+\label{tab:inj}
+\centering
+\small
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Class & S0 raw & S1 sanitized & S2 S1+warning \\
+\midrule
+C0 & 0\% (0) & 0\% (0) & 0\% (0) \\
+N0 & 0\% (0) & 0\% (0) & 0\% (0) \\
+I-N & 1.7\% (1) & 0\% (0) & 0\% (0) \\
+I-C & 13.3\% (8) & 0\% (0) & 0\% (0) \\
+I-B & 58.3\% (35) & 0\% (0) & 0\% (0) \\
+N-I & 71.7\% (43) & 53.3\% (32) & 33.3\% (20) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figs/fig_injection.png}
+\caption{Wrong-target rate by class and treatment with 95\% Wilson intervals.}
+\label{fig:inj}
+\end{figure}
+
+On raw text, placing the attack in both fields (58.3\%) is far stronger than in the command line alone (13.3\%), and name-only attacks barely work (1/60), consistent with the 15-byte name limit. S1 and S2 reduced threat-class errors to 0/60 (McNemar $p<0.001$ for I-B and $p=0.008$ for I-C; for I-N, $p=1.0$ because only one failure existed to be fixed). The no-threat case N-I is much harder: S1 reduced it from 71.7\% to 53.3\% ($p=0.013$) and S2 to 33.3\% ($p<0.001$), so a third of the time the model still terminated an innocent process when nothing was wrong. A result of ``0/60'' means no failure observed, and its 95\% upper bound is about 6\%.
+
+\subsection{Latency by treatment}
+The same 360 instances were run under each treatment, so latency can be compared directly (Table~\ref{tab:lat}). Sanitization made the model about 40\% slower (7.7~s per decision). The three means average to the overall $L=24.3$~s. We did not verify the cause. Longer prompts from JSON quoting (and, for S2, the warning) are the likely reason, and the prompt-token counts in the result file can confirm it.
+
+\begin{table}[t]
+\caption{Mean inference latency by treatment (360 trials each)}
+\label{tab:lat}
+\centering
+\small
+\begin{tabular}{@{}lccc@{}}
+\toprule
+ & S0 & S1 & S2 \\
+\midrule
+Mean latency (s) & 19.1 & 26.8 & 27.0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{PID reuse (E2)}
+Fig.~\ref{fig:reuse} and Table~\ref{tab:reuse} compare the S0 replay with the S0 real-inference run. In both, the PID was recycled before the action at delays of 0, 0.25 and 0.5\,$L$, and in every such trial the naive executor signalled the innocent process (misfire rate 1.00). At 2\,$L$ and with no reuse, no misfire occurred. The \texttt{starttime} and \texttt{pidfd} executors produced no misfire in any row of either run (replay upper bound about 3.7\% per cell, $n=100$). All 1{,}200 replay trials forced the PID successfully (\texttt{recycle\_failed} $=0$).
+
+\begin{table}[t]
+\caption{Naive misfire rate, S0, replay vs.\ real inference. Real 95\% intervals are wide ($n=10$)}
+\label{tab:reuse}
+\centering
+\small
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Delay & Replay & Real & Real 95\% CI \\
+\midrule
+0, 0.25, 0.5\,$L$ & 1.00 & 1.00 & 0.68--1.00 \\
+1\,$L$ & 0.02 & 0.11 & 0.02--0.44 \\
+2\,$L$, none & 0.00 & 0.00 & 0.00--0.35 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figs/fig_pidreuse.png}
+\caption{Naive misfire rate against recycle delay (S0). \texttt{starttime} and \texttt{pidfd} are at zero in both runs.}
+\label{fig:reuse}
+\end{figure}
+
+The $1\,L$ row is low in both runs, which at first looked wrong. At $1\,L$ the action fired on average at about 19.6~s (replay, rescaled) and 20.8~s (real), while the recycle occurred at about 24.5~s, so only the slowest answers (2/100 and 1/10) came after the recycle. The cause is that $\delta$ is a multiple of the \emph{overall} mean $L=24.3$~s, whereas S0 latency averages 19.1~s. The crossover for S0 is therefore near $0.8\,L$, and for S1 and S2 (about 27~s) it is near $1.1\,L$. S1 rows of the replay are expected to show higher misfire at $1\,L$ than S0 for this reason; no real-inference run covers S1.
+
+For natural (unforced) reuse, the analytic risk $\min(1,\lambda L/\mathrm{pid\_max})$ with $L=24.3$~s and $\mathrm{pid\_max}=32768$ gives about 0.7\%, 7\% and 74\% for fork rates $\lambda$ of 10, 100 and 1000 per second. This is a model, not a measurement.
+
+\section{Discussion}
+\subsection{Answering the research question}
+\textbf{(a) Injection.} Without sanitization, an attacker who controls both fields can redirect the defender in a majority of cases, and a benign process carrying a kill order is obeyed in most cases. Stripping, limiting and quoting removed every observed threat-class redirection. It helped much less when no real threat existed.
+
+\textbf{(b) PID reuse.} Whether the reuse window matters depends on how long inference takes compared to how fast the PID is recycled. When the PID was recycled before the action, naive misfired every time, and the identity-verified executors never did. This contrast is close to deterministic by design: the checks are ordinary OS operations and need no model. Holding the decision fixed means the model enters E2 only through its latency distribution, which sets the size of the window. A slower model or prompt means more exposure, and the identity checks work regardless of latency.
+
+\subsection{The two defenses interact}
+Sanitization lowers injection errors but makes inference about 40\% slower, which lengthens the interval in which a PID can be recycled. Sanitization alone therefore trades one risk for another. An identity-verified action closes the reuse window without adding delay, so the combination of S1 and a start-time or \texttt{pidfd} check is better supported by the data than either alone. Because the check refuses the action when the original process is gone, the cost is that the decision is not carried out; in the tested scenario that is correct, because the miner had already exited.
+
+\subsection{Choices and why}
+\begin{itemize}
+\item \emph{One main model.} Llama-3.1 8B was the only model that passed the baseline gate; weaker models would make attack effects unreadable.
+\item \emph{Temperature 0 only.} It is the validated setting, gives repeatable instances for paired comparison, and half the compute of adding 0.7.
+\item \emph{$n=60$ per cell, S2 included.} This fitted about 6.3~h of unattended compute while still giving paired tests.
+\item \emph{Frozen prompt.} Changed once during the pilot, then fixed before the main run.
+\item \emph{Fixed memory cap.} The 8~GB limit is the experiment's defender box, so it was never raised, and the context size was not changed during a run.
+\item \emph{Replay for E2.} It makes 1{,}200 trials practical, and the small real run checks it.
+\end{itemize}
+
+\subsection{Errors encountered}
+\label{sec:errors}
+During E1, Docker reported \texttt{OOMKilled=true}. The cgroup counter showed five kernel kills of Ollama's model runner, and the error file grew to 11 failed trials. The harness itself stayed alive, the failed trials were logged and never written to the results file, and Ollama restarted the runner. Resident (anonymous) memory was 5.47~GiB, with the remaining usage being file cache that reached 7.87~GiB of the 8~GiB cap, so the peaks were short spikes at model reloads. Re-running the same command retried exactly the 11 missing trials until 1{,}080 rows existed. No slow outliers remained (maximum 57~s against a 73~s filter threshold), so the clean-copy step was skipped. An earlier estimate of $L=19$~s from the pilot was replaced by the measured 24.3~s before E2, since the delays are multiples of $L$. Minor issues: a pandas warning about mixed-type columns (harmless), and one analysis table that printed no rows (not used; latency figures were computed separately).
+
+\subsection{Limitations}
+\begin{itemize}
+\item One 8B model, one quantization, one prompt, temperature 0. We make no claim about other models or sampling temperatures.
+\item Obvious-difficulty scenarios only, with idle dummy processes and synthetic CPU values. Payloads are a fixed set of 14, not adaptive attacks.
+\item S1's perfect score may partly come from truncation: the 120-character limit could cut off a payload appended after other arguments. This was not tested. Raising the limit (e.g., to 400) on I-C and I-B would separate truncation from quoting. S1's smaller effect on N-I, whose carriers are short, is consistent with this but does not prove it.
+\item The injection table counts wrong-target kills. Suppression (``none'' while a miner runs) is recorded in \texttt{injection\_rates.csv} and is not discussed here.
+\item The replay assumes a correct decision, so E2 gives a conditional misfire rate, and the latency pool mixes all six classes while E2 uses C0. Time scaling shrinks sleeps but not process-spawn or check-then-kill overheads. The real validation is small ($n=10$, S0 only), so only the broad pattern is confirmed.
+\item ``No misfire'' for \texttt{starttime} and \texttt{pidfd} means none observed. The start-time check has a small check-then-kill gap and tick-level resolution that this setup is unlikely to expose.
+\end{itemize}
+
+\section{Conclusion}
+On CPU-only 8~GB hardware, a local 8B defender fed raw telemetry took a wrong-target action in up to 58.3\% of attacked threat cases and 71.7\% of attacked no-threat cases. Sanitization removed all observed threat-class errors but only partly reduced the no-threat case, and it increased inference latency by about 40\%. During that latency, a recycled PID was hit by a naive kill in every trial where recycling preceded the action, while start-time and \texttt{pidfd} checks refused every time. The practical recommendation is layered: sanitize the telemetry, and never act on a bare PID. Future work includes other models and temperatures, adaptive attackers, a truncation-versus-quoting ablation, and real-inference validation of the S1 race.
+
+\section*{Code Availability}
+The harness, scripts and result tables are in the project's GitHub repository (see the README for run instructions): \url{[add repository URL]}.
+
+\begin{thebibliography}{00}
+\bibitem{greshake} K. Greshake, S. Abdelnabi, S. Mishra, C. Endres, T. Holz, and M. Fritz, ``Not what you've signed up for: Compromising real-world LLM-integrated applications with indirect prompt injection,'' arXiv:2302.12173, 2023.
+\bibitem{perez} F. Perez and I. Ribeiro, ``Ignore previous prompt: Attack techniques for language models,'' arXiv:2211.09527, 2022.
+\bibitem{liu} Y. Liu et al., ``Prompt injection attack against LLM-integrated applications,'' arXiv:2306.05499, 2023.
+\bibitem{pidfd} Linux man-pages, \texttt{pidfd\_open(2)} and \texttt{pidfd\_send\_signal(2)}.
+\bibitem{llama3} A. Dubey et al., ``The Llama 3 herd of models,'' arXiv:2407.21783, 2024.
+\bibitem{ollama} Ollama project, ``Ollama,'' \url{https://ollama.com}.
+\bibitem{wilson} E. B. Wilson, ``Probable inference, the law of succession, and statistical inference,'' \emph{J. Am. Stat. Assoc.}, vol. 22, no. 158, pp. 209--212, 1927.
+\bibitem{mcnemar} Q. McNemar, ``Note on the sampling error of the difference between correlated proportions or percentages,'' \emph{Psychometrika}, vol. 12, no. 2, pp. 153--157, 1947.
+\end{thebibliography}
+
+\end{document}

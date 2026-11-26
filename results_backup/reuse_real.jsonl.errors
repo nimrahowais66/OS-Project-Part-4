@@ -1,0 +1,1 @@
+{"item": {"cls": "C0", "inst": 3, "san": "S0", "temp": 0.0, "seed": 3, "difficulty": "obvious", "reuse": {"t_exit": 0.5, "delta": 6.0, "label": "x0.25L"}}, "err": "HTTPError('500 Server Error: Internal Server Error for url: http://127.0.0.1:11434/api/chat')"}

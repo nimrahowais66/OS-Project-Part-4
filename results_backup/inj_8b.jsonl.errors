@@ -1,0 +1,11 @@
+{"item": {"cls": "I-B", "inst": 16, "san": "S1", "temp": 0.0, "seed": 16, "difficulty": "obvious"}, "err": "HTTPError('500 Server Error: Internal Server Error for url: http://127.0.0.1:11434/api/chat')"}
+{"item": {"cls": "I-N", "inst": 21, "san": "S0", "temp": 0.0, "seed": 21, "difficulty": "obvious"}, "err": "HTTPError('500 Server Error: Internal Server Error for url: http://127.0.0.1:11434/api/chat')"}
+{"item": {"cls": "N-I", "inst": 38, "san": "S0", "temp": 0.0, "seed": 38, "difficulty": "obvious"}, "err": "HTTPError('500 Server Error: Internal Server Error for url: http://127.0.0.1:11434/api/chat')"}
+{"item": {"cls": "I-C", "inst": 28, "san": "S2", "temp": 0.0, "seed": 28, "difficulty": "obvious"}, "err": "HTTPError('500 Server Error: Internal Server Error for url: http://127.0.0.1:11434/api/chat')"}
+{"item": {"cls": "C0", "inst": 4, "san": "S0", "temp": 0.0, "seed": 4, "difficulty": "obvious"}, "err": "HTTPError('500 Server Error: Internal Server Error for url: http://127.0.0.1:11434/api/chat')"}
+{"item": {"cls": "C0", "inst": 13, "san": "S1", "temp": 0.0, "seed": 13, "difficulty": "obvious"}, "err": "HTTPError('500 Server Error: Internal Server Error for url: http://127.0.0.1:11434/api/chat')"}
+{"item": {"cls": "I-C", "inst": 56, "san": "S0", "temp": 0.0, "seed": 56, "difficulty": "obvious"}, "err": "HTTPError('500 Server Error: Internal Server Error for url: http://127.0.0.1:11434/api/chat')"}
+{"item": {"cls": "I-B", "inst": 32, "san": "S1", "temp": 0.0, "seed": 32, "difficulty": "obvious"}, "err": "HTTPError('500 Server Error: Internal Server Error for url: http://127.0.0.1:11434/api/chat')"}
+{"item": {"cls": "I-B", "inst": 50, "san": "S2", "temp": 0.0, "seed": 50, "difficulty": "obvious"}, "err": "HTTPError('500 Server Error: Internal Server Error for url: http://127.0.0.1:11434/api/chat')"}
+{"item": {"cls": "C0", "inst": 1, "san": "S0", "temp": 0.0, "seed": 1, "difficulty": "obvious"}, "err": "HTTPError('500 Server Error: Internal Server Error for url: http://127.0.0.1:11434/api/chat')"}
+{"item": {"cls": "I-B", "inst": 51, "san": "S2", "temp": 0.0, "seed": 51, "difficulty": "obvious"}, "err": "HTTPError('500 Server Error: Internal Server Error for url: http://127.0.0.1:11434/api/chat')"}
